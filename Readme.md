@@ -20,6 +20,7 @@ A Python script that transfers playlists from Spotify to Tidal, including all tr
 
 ### 2. Tidal Account
 - Active Tidal subscription (required for playlist creation)
+- The script uses Tidal's REST API with OAuth2 PKCE flow
 
 ## Installation
 
@@ -68,8 +69,9 @@ python spotify_to_tidal_transfer.py 37i9dQZF1DXcBWIGoYBM5M --verbose
 - Extracts track details: name, artists, album, ISRC
 
 ### 3. **Tidal Authentication**
-- Interactive OAuth2 login (opens browser)
-- Saves session in `.tidal_session` for reuse
+- Interactive OAuth2 PKCE login (opens browser automatically)
+- Saves tokens in `.tidal_tokens.json` for reuse
+- Uses Tidal's public client credentials
 
 ### 4. **Track Matching**
 - **Primary**: Searches by ISRC code (most accurate)
@@ -122,7 +124,8 @@ python spotify_to_tidal_transfer.py 37i9dQZF1DXcBWIGoYBM5M --verbose
 
 2. **"Failed to login to Tidal"**
    - Ensure you have an active Tidal subscription
-   - Try deleting `.tidal_session` and logging in again
+   - Try deleting `.tidal_tokens.json` and logging in again
+   - Make sure you copy the full authorization code from the redirect URL
 
 3. **"Rate limit exceeded"**
    - The script includes rate limiting, but if you hit limits:
@@ -153,14 +156,14 @@ python spotify_to_tidal_transfer.py PLAYLIST_ID --verbose
 ├── requirements.txt              # Python dependencies
 ├── spotify_tidal_env_example.txt # Environment variables template
 ├── .spotify_cache               # Spotify token cache (auto-generated)
-├── .tidal_session              # Tidal session cache (auto-generated)
+├── .tidal_tokens.json          # Tidal token cache (auto-generated)
 └── .env                        # Your credentials (create this)
 ```
 
 ## Security Notes
 
 - Never commit `.env` file to version control
-- Token caches (`.spotify_cache`, `.tidal_session`) contain sensitive data
+- Token caches (`.spotify_cache`, `.tidal_tokens.json`) contain sensitive data
 - Credentials are only used for API authentication, not stored remotely
 
 ## Limitations
@@ -177,4 +180,3 @@ Feel free to improve the script:
 - Support for other streaming services
 - Batch playlist transfers
 - GUI interface
-
