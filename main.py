@@ -12,7 +12,7 @@ Requirements:
 
 Install with: pip install spotipy tidalapi python-dotenv
 """
-
+from dotenv import load_dotenv
 import os
 import sys
 import time
@@ -34,6 +34,7 @@ class SpotifyToTidalTransfer:
         
     def _init_spotify(self) -> spotipy.Spotify:
         """Initialize Spotify client with OAuth"""
+        print("initializing spotify .....")
         client_id = os.getenv('SPOTIFY_CLIENT_ID')
         client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
         redirect_uri = os.getenv('SPOTIFY_REDIRECT_URI', 'http://localhost:8888/callback')
@@ -51,10 +52,14 @@ class SpotifyToTidalTransfer:
             cache_path=".spotify_cache"
         )
         
+        print("ok\n")
         return spotipy.Spotify(auth_manager=auth_manager)
     
     def _init_tidal(self) -> tidalapi.Session:
         """Initialize Tidal session"""
+        print("initializing Tidal...")
+        client_id = os.getenv("TIDAL_CLIENT_ID")
+        client_secret = os.getenv("TIDAL_CLIENT_SECRET")
         session = tidalapi.Session()
         
         # Try to load existing session
@@ -69,18 +74,29 @@ class SpotifyToTidalTransfer:
         
         # Login to Tidal
         print("🔐 Logging into Tidal...")
-        login_url, future = session.login_oauth()
-        print(f"Please visit this URL to authorize: {login_url}")
+        # login_url, future = session.login_oauth()
+        # print(f"Please visit this URL to authorize: {login_url}")
+        session.login_oauth_simple(fn_print=print)
+        print(session.check_login())
+
+        token_type = session.token_type
+        access_token = session.access_token
+        refresh_token = session.refresh_token # Not needed if you don't care about refreshing
+        expiry_time = session.expiry_time
+
+        print("y ahora???")
+
+        return session
         
-        # Wait for login completion
-        session.login_oauth_simple(function=future)
+        # # Wait for login completion
+        # session.login_oauth_simple(function=future)
         
-        if session.check_login():
-            session.save_oauth_session('.tidal_session')
-            print("✅ Successfully logged into Tidal")
-            return session
-        else:
-            raise Exception("Failed to login to Tidal")
+        # if session.check_login():
+        #     session.save_oauth_session('.tidal_session')
+        #     print("✅ Successfully logged into Tidal")
+        #     return session
+        # else:
+        #     raise Exception("Failed to login to Tidal")
     
     def get_spotify_playlist(self, playlist_id: str) -> Dict:
         """Fetch playlist information from Spotify"""
@@ -89,10 +105,14 @@ class SpotifyToTidalTransfer:
             
             # Get playlist metadata
             playlist = self.spotify.playlist(playlist_id)
+
+            print("retorno de la funcion ok")
             
             # Get all tracks (handle pagination)
             tracks = []
+            print("pide tracks...")
             results = self.spotify.playlist_tracks(playlist_id)
+            print("retorno ok")
             
             while results:
                 tracks.extend(results['items'])
@@ -123,6 +143,15 @@ class SpotifyToTidalTransfer:
                     playlist_info['tracks'].append(track_info)
             
             print(f"✅ Found {len(playlist_info['tracks'])} tracks in playlist '{playlist_info['name']}'")
+
+            # Recorremos la lista de tracks dentro de playlist_info
+            for track in playlist_info['tracks']:
+                name = track['name']
+                isrc = track['isrc']
+                
+                # Imprimimos los valores (usando un valor por defecto si el ISRC es None)
+                print(f"Name: {name} | ISRC: {isrc if isrc else 'N/A'}")            
+
             return playlist_info
             
         except Exception as e:
@@ -134,29 +163,38 @@ class SpotifyToTidalTransfer:
         try:
             # Try searching by ISRC first (most accurate)
             if track_info.get('isrc'):
-                search_results = self.tidal.search('track', track_info['isrc'])
-                if search_results and search_results['tracks']:
-                    return search_results['tracks'][0]
+                print("en Spotify tiene isrc, voy a buscar en Tidal....")
+                #JLD search_results = self.tidal.search('track', track_info['isrc'])
+                isrc_a_buscar = track_info['isrc']
+                cad = f"filter%5Bisrc%5D={isrc_a_buscar}"
+                print("cad:" + cad)
+                search_results = self.tidal.search(cad, models=[tidalapi.Track])
+                if search_results:
+                    print ("YESSSS")
+                    print(search_results)
+                    if search_results['tracks']:
+                        print ("YESSSS 22222")
+                        return search_results['tracks'][0]
             
-            # Fallback to artist + track name search
-            artist_names = ' '.join(track_info['artists'])
-            query = f"{artist_names} {track_info['name']}"
+            # # Fallback to artist + track name search
+            # artist_names = ' '.join(track_info['artists'])
+            # query = f"{artist_names} {track_info['name']}"
             
-            search_results = self.tidal.search('track', query, limit=10)
+            # search_results = self.tidal.search('track', query, limit=10)
             
-            if search_results and search_results['tracks']:
-                # Try to find the best match
-                for track in search_results['tracks']:
-                    # Check if artist names match (case-insensitive)
-                    tidal_artists = [artist.name.lower() for artist in track.artists]
-                    spotify_artists = [artist.lower() for artist in track_info['artists']]
+            # if search_results and search_results['tracks']:
+            #     # Try to find the best match
+            #     for track in search_results['tracks']:
+            #         # Check if artist names match (case-insensitive)
+            #         tidal_artists = [artist.name.lower() for artist in track.artists]
+            #         spotify_artists = [artist.lower() for artist in track_info['artists']]
                     
-                    # Check for artist overlap
-                    if any(spotify_artist in ' '.join(tidal_artists) for spotify_artist in spotify_artists):
-                        return track
+            #         # Check for artist overlap
+            #         if any(spotify_artist in ' '.join(tidal_artists) for spotify_artist in spotify_artists):
+            #             return track
                 
-                # If no perfect match, return the first result
-                return search_results['tracks'][0]
+            #     # If no perfect match, return the first result
+            #     return search_results['tracks'][0]
             
             return None
             
@@ -204,6 +242,7 @@ class SpotifyToTidalTransfer:
                 tidal_track = self.search_tidal_track(track_info)
                 
                 if tidal_track:
+                    print("ok in TIDAL")
                     # Add track to playlist
                     success = playlist.add([tidal_track.id])
                     if success:
@@ -213,6 +252,7 @@ class SpotifyToTidalTransfer:
                         results['errors'] += 1
                         print(f"    ❌ Failed to add: {track_info['artists'][0]} - {track_info['name']}")
                 else:
+                    print("FAIL in TIDAL")
                     results['not_found'] += 1
                     results['not_found_tracks'].append(f"{track_info['artists'][0]} - {track_info['name']}")
                     print(f"    ⚠️  Not found: {track_info['artists'][0]} - {track_info['name']}")
