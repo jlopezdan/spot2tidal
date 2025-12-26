@@ -1,4 +1,4 @@
 # Spotify to Tidal Transfer Requirements
 spotipy==2.23.0
-tidalapi==0.8.10
+requests==2.31.0
 python-dotenv==1.0.0
