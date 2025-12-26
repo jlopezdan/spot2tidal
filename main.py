@@ -38,13 +38,23 @@ class TidalAPI:
     def __init__(self):
         self.base_url = "https://api.tidal.com/v1"
         self.auth_url = "https://auth.tidal.com/v1/oauth2"
-        self.client_id = "zU4XHVVkc2tDPo4t"  # Tidal's public client ID
-        self.client_secret = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4="
+        
+        # Get Tidal client credentials from environment variables
+        self.client_id = os.getenv('TIDAL_CLIENT_ID')
+        self.client_secret = os.getenv('TIDAL_CLIENT_SECRET')
+        
+        if not self.client_id or not self.client_secret:
+            raise ValueError("Missing Tidal credentials. Set TIDAL_CLIENT_ID and TIDAL_CLIENT_SECRET environment variables")
+        
         self.access_token = None
         self.refresh_token = None
         self.user_id = None
         self.country_code = None
         self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'TIDAL_ANDROID/1039 okhttp/4.9.2',
+            'X-Tidal-Token': self.client_id
+        })
         
     def _generate_code_verifier(self) -> str:
         """Generate PKCE code verifier"""
@@ -56,63 +66,102 @@ class TidalAPI:
         return base64.urlsafe_b64encode(digest).decode('utf-8').rstrip('=')
     
     def login(self) -> bool:
-        """Login to Tidal using OAuth2 PKCE flow"""
+        """Login to Tidal using device flow authentication"""
         try:
             # Check if we have saved tokens
             if self._load_tokens():
-                if self._refresh_access_token():
+                if self._test_token():
                     print("✅ Loaded existing Tidal session")
                     return True
-            
-            print("🔐 Logging into Tidal...")
-            
-            # Generate PKCE parameters
-            code_verifier = self._generate_code_verifier()
-            code_challenge = self._generate_code_challenge(code_verifier)
-            
-            # Authorization URL
-            auth_params = {
-                'response_type': 'code',
-                'client_id': self.client_id,
-                'redirect_uri': 'http://localhost:8080',
-                'scope': 'r_usr w_usr',
-                'code_challenge': code_challenge,
-                'code_challenge_method': 'S256'
-            }
-            
-            auth_url = f"{self.auth_url}/authorize?" + urllib.parse.urlencode(auth_params)
-            print(f"Please visit this URL to authorize: {auth_url}")
-            
-            # Open browser automatically
-            webbrowser.open(auth_url)
-            
-            # Get authorization code from user
-            auth_code = input("Enter the authorization code from the redirect URL: ").strip()
-            
-            # Exchange code for tokens
-            token_data = {
-                'grant_type': 'authorization_code',
-                'client_id': self.client_id,
-                'client_secret': self.client_secret,
-                'code': auth_code,
-                'redirect_uri': 'http://localhost:8080',
-                'code_verifier': code_verifier
-            }
-            
-            response = requests.post(f"{self.auth_url}/token", data=token_data)
-            
-            if response.status_code == 200:
-                token_info = response.json()
-                self.access_token = token_info['access_token']
-                self.refresh_token = token_info.get('refresh_token')
-                
-                # Get user info
-                if self._get_user_info():
-                    self._save_tokens()
-                    print("✅ Successfully logged into Tidal")
+                elif self._refresh_access_token():
+                    print("✅ Refreshed Tidal session")
                     return True
             
-            print(f"❌ Failed to get access token: {response.text}")
+            print("🔐 Logging into Tidal using device flow...")
+            
+            # Step 1: Get device code
+            device_data = {
+                'client_id': self.client_id,
+                'scope': 'r_usr w_usr w_sub'
+            }
+            
+            device_response = requests.post(
+                f"{self.auth_url}/device_authorization",
+                data=device_data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            )
+            
+            if device_response.status_code != 200:
+                print(f"❌ Failed to get device code: {device_response.text}")
+                return False
+            
+            device_info = device_response.json()
+            
+            print(f"\n🔗 Please visit: {device_info['verification_uri']}")
+            print(f"📱 Enter this code: {device_info['user_code']}")
+            print("⏳ Waiting for authorization...")
+            
+            # Open browser automatically
+            webbrowser.open(device_info['verification_uri'])
+            
+            # Step 2: Poll for token
+            poll_data = {
+                'client_id': self.client_id,
+                'client_secret': self.client_secret,
+                'device_code': device_info['device_code'],
+                'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
+            }
+            
+            interval = device_info.get('interval', 5)
+            expires_in = device_info.get('expires_in', 300)
+            max_attempts = expires_in // interval
+            
+            for attempt in range(max_attempts):
+                time.sleep(interval)
+                
+                token_response = requests.post(
+                    f"{self.auth_url}/token",
+                    data=poll_data,
+                    headers={'Content-Type': 'application/x-www-form-urlencoded'}
+                )
+                
+                if token_response.status_code == 200:
+                    token_info = token_response.json()
+                    self.access_token = token_info['access_token']
+                    self.refresh_token = token_info.get('refresh_token')
+                    
+                    # Get user info
+                    if self._get_user_info():
+                        self._save_tokens()
+                        print("✅ Successfully logged into Tidal")
+                        return True
+                    else:
+                        print("❌ Failed to get user info")
+                        return False
+                
+                elif token_response.status_code == 400:
+                    error_data = token_response.json()
+                    error_code = error_data.get('error', '')
+                    
+                    if error_code == 'authorization_pending':
+                        print(f"⏳ Still waiting... (attempt {attempt + 1}/{max_attempts})")
+                        continue
+                    elif error_code == 'slow_down':
+                        interval += 5
+                        continue
+                    elif error_code == 'expired_token':
+                        print("❌ Device code expired. Please try again.")
+                        return False
+                    elif error_code == 'access_denied':
+                        print("❌ Access denied by user.")
+                        return False
+                    else:
+                        print(f"❌ Token error: {error_data}")
+                        return False
+                else:
+                    print(f"❌ Unexpected response: {token_response.status_code} - {token_response.text}")
+            
+            print("❌ Authentication timed out")
             return False
             
         except Exception as e:
@@ -148,6 +197,18 @@ class TidalAPI:
         except Exception as e:
             print(f"⚠️  Failed to save tokens: {e}")
     
+    def _test_token(self) -> bool:
+        """Test if current access token is valid"""
+        if not self.access_token:
+            return False
+        
+        try:
+            headers = {'Authorization': f'Bearer {self.access_token}'}
+            response = self.session.get(f"{self.base_url}/users/me", headers=headers)
+            return response.status_code == 200
+        except Exception:
+            return False
+    
     def _refresh_access_token(self) -> bool:
         """Refresh access token using refresh token"""
         if not self.refresh_token:
@@ -161,7 +222,11 @@ class TidalAPI:
                 'refresh_token': self.refresh_token
             }
             
-            response = requests.post(f"{self.auth_url}/token", data=token_data)
+            response = requests.post(
+                f"{self.auth_url}/token", 
+                data=token_data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            )
             
             if response.status_code == 200:
                 token_info = response.json()
@@ -170,6 +235,8 @@ class TidalAPI:
                     self.refresh_token = token_info['refresh_token']
                 self._save_tokens()
                 return True
+            else:
+                print(f"⚠️  Token refresh failed: {response.status_code} - {response.text}")
                 
         except Exception as e:
             print(f"⚠️  Failed to refresh token: {e}")
@@ -195,10 +262,15 @@ class TidalAPI:
     def _make_request(self, method: str, endpoint: str, **kwargs) -> Optional[requests.Response]:
         """Make authenticated request to Tidal API"""
         if not self.access_token:
+            print("❌ No access token available")
             return None
         
         headers = kwargs.get('headers', {})
-        headers['Authorization'] = f'Bearer {self.access_token}'
+        headers.update({
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        })
         kwargs['headers'] = headers
         
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
@@ -208,9 +280,16 @@ class TidalAPI:
             
             # Handle token expiration
             if response.status_code == 401:
+                print("🔄 Token expired, attempting refresh...")
                 if self._refresh_access_token():
                     headers['Authorization'] = f'Bearer {self.access_token}'
                     response = self.session.request(method, url, **kwargs)
+                else:
+                    print("❌ Failed to refresh token")
+                    return None
+            
+            if response.status_code >= 400:
+                print(f"⚠️  API Error {response.status_code}: {response.text}")
             
             return response
         except Exception as e:
@@ -223,7 +302,7 @@ class TidalAPI:
             'query': query,
             'type': 'TRACKS',
             'limit': limit,
-            'countryCode': self.country_code
+            'countryCode': self.country_code or 'US'
         }
         
         response = self._make_request('GET', '/search', params=params)
@@ -231,6 +310,8 @@ class TidalAPI:
         if response and response.status_code == 200:
             data = response.json()
             return data.get('tracks', {}).get('items', [])
+        elif response:
+            print(f"⚠️  Search failed: {response.status_code} - {response.text}")
         
         return []
     
@@ -250,13 +331,33 @@ class TidalAPI:
     
     def add_tracks_to_playlist(self, playlist_uuid: str, track_ids: List[int]) -> bool:
         """Add tracks to playlist"""
-        data = {
-            'trackIds': ','.join(map(str, track_ids))
+        # Convert to the format Tidal expects
+        track_ids_str = ','.join(map(str, track_ids))
+        
+        # Use form data instead of JSON for this endpoint
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/x-www-form-urlencoded'
         }
         
-        response = self._make_request('POST', f'/playlists/{playlist_uuid}/tracks', data=data)
+        data = {
+            'trackIds': track_ids_str
+        }
         
-        return response and response.status_code == 200
+        url = f"{self.base_url}/playlists/{playlist_uuid}/tracks"
+        
+        try:
+            response = self.session.post(url, data=data, headers=headers)
+            
+            if response.status_code == 200:
+                return True
+            else:
+                print(f"⚠️  Failed to add tracks: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"⚠️  Error adding tracks: {e}")
+            return False
 
 class SpotifyToTidalTransfer:        
     def _init_spotify(self) -> spotipy.Spotify:
