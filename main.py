@@ -7,34 +7,356 @@ a corresponding playlist in Tidal with the same tracks.
 
 Requirements:
 - spotipy (Spotify Web API wrapper)
-- tidalapi (Tidal API wrapper)
+- requests (HTTP library)
 - python-dotenv (for environment variables)
 
-Install with: pip install spotipy tidalapi python-dotenv
+Install with: pip install spotipy requests python-dotenv
 """
-from dotenv import load_dotenv
+
 import os
 import sys
 import time
+import json
+import base64
+import hashlib
+import secrets
+import urllib.parse
+import webbrowser
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-import tidalapi
+import requests
 import argparse
 
 # Load environment variables
 load_dotenv()
 
-class SpotifyToTidalTransfer:
+class TidalAPI:
+    """Tidal REST API client"""
+    
     def __init__(self):
-        """Initialize Spotify and Tidal clients"""
-        self.spotify = self._init_spotify()
-        self.tidal = self._init_tidal()
+        self.base_url = "https://api.tidal.com/v1"
+        self.auth_url = "https://auth.tidal.com/v1/oauth2"
+        # Updated Tidal client credentials
+        self.client_id = "CzET4vdadNUFQ5JU"
+        self.client_secret = "pl4Vc0hemlAXD0mN"
+        self.access_token = None
+        self.refresh_token = None
+        self.user_id = None
+        self.country_code = None
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'TIDAL_ANDROID/1039 okhttp/4.9.2',
+            'X-Tidal-Token': 'CzET4vdadNUFQ5JU'
+        })
         
+    def _generate_code_verifier(self) -> str:
+        """Generate PKCE code verifier"""
+        return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
+    
+    def _generate_code_challenge(self, verifier: str) -> str:
+        """Generate PKCE code challenge"""
+        digest = hashlib.sha256(verifier.encode('utf-8')).digest()
+        return base64.urlsafe_b64encode(digest).decode('utf-8').rstrip('=')
+    
+    def login(self) -> bool:
+        """Login to Tidal using device flow authentication"""
+        try:
+            # Check if we have saved tokens
+            if self._load_tokens():
+                if self._test_token():
+                    print("✅ Loaded existing Tidal session")
+                    return True
+                elif self._refresh_access_token():
+                    print("✅ Refreshed Tidal session")
+                    return True
+            
+            print("🔐 Logging into Tidal using device flow...")
+            
+            # Step 1: Get device code
+            device_data = {
+                'client_id': self.client_id,
+                'scope': 'r_usr w_usr w_sub'
+            }
+            
+            device_response = requests.post(
+                f"{self.auth_url}/device_authorization",
+                data=device_data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            )
+            
+            if device_response.status_code != 200:
+                print(f"❌ Failed to get device code: {device_response.text}")
+                return False
+            
+            device_info = device_response.json()
+            
+            print(f"\n🔗 Please visit: {device_info['verification_uri']}")
+            print(f"📱 Enter this code: {device_info['user_code']}")
+            print("⏳ Waiting for authorization...")
+            
+            # Open browser automatically
+            webbrowser.open(device_info['verification_uri'])
+            
+            # Step 2: Poll for token
+            poll_data = {
+                'client_id': self.client_id,
+                'client_secret': self.client_secret,
+                'device_code': device_info['device_code'],
+                'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
+            }
+            
+            interval = device_info.get('interval', 5)
+            expires_in = device_info.get('expires_in', 300)
+            max_attempts = expires_in // interval
+            
+            for attempt in range(max_attempts):
+                time.sleep(interval)
+                
+                token_response = requests.post(
+                    f"{self.auth_url}/token",
+                    data=poll_data,
+                    headers={'Content-Type': 'application/x-www-form-urlencoded'}
+                )
+                
+                if token_response.status_code == 200:
+                    token_info = token_response.json()
+                    self.access_token = token_info['access_token']
+                    self.refresh_token = token_info.get('refresh_token')
+                    
+                    # Get user info
+                    if self._get_user_info():
+                        self._save_tokens()
+                        print("✅ Successfully logged into Tidal")
+                        return True
+                    else:
+                        print("❌ Failed to get user info")
+                        return False
+                
+                elif token_response.status_code == 400:
+                    error_data = token_response.json()
+                    error_code = error_data.get('error', '')
+                    
+                    if error_code == 'authorization_pending':
+                        print(f"⏳ Still waiting... (attempt {attempt + 1}/{max_attempts})")
+                        continue
+                    elif error_code == 'slow_down':
+                        interval += 5
+                        continue
+                    elif error_code == 'expired_token':
+                        print("❌ Device code expired. Please try again.")
+                        return False
+                    elif error_code == 'access_denied':
+                        print("❌ Access denied by user.")
+                        return False
+                    else:
+                        print(f"❌ Token error: {error_data}")
+                        return False
+                else:
+                    print(f"❌ Unexpected response: {token_response.status_code} - {token_response.text}")
+            
+            print("❌ Authentication timed out")
+            return False
+            
+        except Exception as e:
+            print(f"❌ Login error: {e}")
+            return False
+    
+    def _load_tokens(self) -> bool:
+        """Load saved tokens from file"""
+        try:
+            if os.path.exists('.tidal_tokens.json'):
+                with open('.tidal_tokens.json', 'r') as f:
+                    data = json.load(f)
+                    self.access_token = data.get('access_token')
+                    self.refresh_token = data.get('refresh_token')
+                    self.user_id = data.get('user_id')
+                    self.country_code = data.get('country_code')
+                    return bool(self.access_token)
+        except Exception:
+            pass
+        return False
+    
+    def _save_tokens(self):
+        """Save tokens to file"""
+        try:
+            data = {
+                'access_token': self.access_token,
+                'refresh_token': self.refresh_token,
+                'user_id': self.user_id,
+                'country_code': self.country_code
+            }
+            with open('.tidal_tokens.json', 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"⚠️  Failed to save tokens: {e}")
+    
+    def _test_token(self) -> bool:
+        """Test if current access token is valid"""
+        if not self.access_token:
+            return False
+        
+        try:
+            headers = {'Authorization': f'Bearer {self.access_token}'}
+            response = self.session.get(f"{self.base_url}/users/me", headers=headers)
+            return response.status_code == 200
+        except Exception:
+            return False
+    
+    def _refresh_access_token(self) -> bool:
+        """Refresh access token using refresh token"""
+        if not self.refresh_token:
+            return False
+        
+        try:
+            token_data = {
+                'grant_type': 'refresh_token',
+                'client_id': self.client_id,
+                'client_secret': self.client_secret,
+                'refresh_token': self.refresh_token
+            }
+            
+            response = requests.post(
+                f"{self.auth_url}/token", 
+                data=token_data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            )
+            
+            if response.status_code == 200:
+                token_info = response.json()
+                self.access_token = token_info['access_token']
+                if 'refresh_token' in token_info:
+                    self.refresh_token = token_info['refresh_token']
+                self._save_tokens()
+                return True
+            else:
+                print(f"⚠️  Token refresh failed: {response.status_code} - {response.text}")
+                
+        except Exception as e:
+            print(f"⚠️  Failed to refresh token: {e}")
+        
+        return False
+    
+    def _get_user_info(self) -> bool:
+        """Get user information"""
+        try:
+            headers = {'Authorization': f'Bearer {self.access_token}'}
+            response = self.session.get(f"{self.base_url}/users/me", headers=headers)
+            
+            if response.status_code == 200:
+                user_info = response.json()
+                self.user_id = user_info['id']
+                self.country_code = user_info['countryCode']
+                return True
+        except Exception as e:
+            print(f"⚠️  Failed to get user info: {e}")
+        
+        return False
+    
+    def _make_request(self, method: str, endpoint: str, **kwargs) -> Optional[requests.Response]:
+        """Make authenticated request to Tidal API"""
+        if not self.access_token:
+            print("❌ No access token available")
+            return None
+        
+        headers = kwargs.get('headers', {})
+        headers.update({
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        })
+        kwargs['headers'] = headers
+        
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        
+        try:
+            response = self.session.request(method, url, **kwargs)
+            
+            # Handle token expiration
+            if response.status_code == 401:
+                print("🔄 Token expired, attempting refresh...")
+                if self._refresh_access_token():
+                    headers['Authorization'] = f'Bearer {self.access_token}'
+                    response = self.session.request(method, url, **kwargs)
+                else:
+                    print("❌ Failed to refresh token")
+                    return None
+            
+            if response.status_code >= 400:
+                print(f"⚠️  API Error {response.status_code}: {response.text}")
+            
+            return response
+        except Exception as e:
+            print(f"⚠️  API request error: {e}")
+            return None
+    
+    def search_tracks(self, query: str, limit: int = 10) -> List[Dict]:
+        """Search for tracks"""
+        params = {
+            'query': query,
+            'type': 'TRACKS',
+            'limit': limit,
+            'countryCode': self.country_code or 'US'
+        }
+        
+        response = self._make_request('GET', '/search', params=params)
+        
+        if response and response.status_code == 200:
+            data = response.json()
+            return data.get('tracks', {}).get('items', [])
+        elif response:
+            print(f"⚠️  Search failed: {response.status_code} - {response.text}")
+        
+        return []
+    
+    def create_playlist(self, title: str, description: str = "") -> Optional[Dict]:
+        """Create a new playlist"""
+        data = {
+            'title': title,
+            'description': description
+        }
+        
+        response = self._make_request('POST', f'/users/{self.user_id}/playlists', json=data)
+        
+        if response and response.status_code == 201:
+            return response.json()
+        
+        return None
+    
+    def add_tracks_to_playlist(self, playlist_uuid: str, track_ids: List[int]) -> bool:
+        """Add tracks to playlist"""
+        # Convert to the format Tidal expects
+        track_ids_str = ','.join(map(str, track_ids))
+        
+        # Use form data instead of JSON for this endpoint
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        
+        data = {
+            'trackIds': track_ids_str
+        }
+        
+        url = f"{self.base_url}/playlists/{playlist_uuid}/tracks"
+        
+        try:
+            response = self.session.post(url, data=data, headers=headers)
+            
+            if response.status_code == 200:
+                return True
+            else:
+                print(f"⚠️  Failed to add tracks: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"⚠️  Error adding tracks: {e}")
+            return False
+
+class SpotifyToTidalTransfer:        
     def _init_spotify(self) -> spotipy.Spotify:
         """Initialize Spotify client with OAuth"""
-        print("initializing spotify .....")
         client_id = os.getenv('SPOTIFY_CLIENT_ID')
         client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
         redirect_uri = os.getenv('SPOTIFY_REDIRECT_URI', 'http://localhost:8888/callback')
@@ -52,51 +374,19 @@ class SpotifyToTidalTransfer:
             cache_path=".spotify_cache"
         )
         
-        print("ok\n")
         return spotipy.Spotify(auth_manager=auth_manager)
     
-    def _init_tidal(self) -> tidalapi.Session:
-        """Initialize Tidal session"""
-        print("initializing Tidal...")
-        client_id = os.getenv("TIDAL_CLIENT_ID")
-        client_secret = os.getenv("TIDAL_CLIENT_SECRET")
-        session = tidalapi.Session()
-        
-        # Try to load existing session
-        if os.path.exists('.tidal_session'):
-            try:
-                session.load_oauth_session('.tidal_session')
-                if session.check_login():
-                    print("✅ Loaded existing Tidal session")
-                    return session
-            except Exception as e:
-                print(f"⚠️  Failed to load Tidal session: {e}")
-        
-        # Login to Tidal
-        print("🔐 Logging into Tidal...")
-        # login_url, future = session.login_oauth()
-        # print(f"Please visit this URL to authorize: {login_url}")
-        session.login_oauth_simple(fn_print=print)
-        print(session.check_login())
-
-        token_type = session.token_type
-        access_token = session.access_token
-        refresh_token = session.refresh_token # Not needed if you don't care about refreshing
-        expiry_time = session.expiry_time
-
-        print("y ahora???")
-
-        return session
-        
-        # # Wait for login completion
-        # session.login_oauth_simple(function=future)
-        
-        # if session.check_login():
-        #     session.save_oauth_session('.tidal_session')
-        #     print("✅ Successfully logged into Tidal")
-        #     return session
-        # else:
-        #     raise Exception("Failed to login to Tidal")
+    def __init__(self):
+        """Initialize Spotify and Tidal clients"""
+        self.spotify = self._init_spotify()
+        self.tidal = TidalAPI()
+        self._init_tidal()
+    
+    def _init_tidal(self) -> bool:
+        """Initialize Tidal API client"""
+        if not self.tidal.login():
+            raise Exception("Failed to login to Tidal")
+        return True
     
     def get_spotify_playlist(self, playlist_id: str) -> Dict:
         """Fetch playlist information from Spotify"""
@@ -105,14 +395,10 @@ class SpotifyToTidalTransfer:
             
             # Get playlist metadata
             playlist = self.spotify.playlist(playlist_id)
-
-            print("retorno de la funcion ok")
             
             # Get all tracks (handle pagination)
             tracks = []
-            print("pide tracks...")
             results = self.spotify.playlist_tracks(playlist_id)
-            print("retorno ok")
             
             while results:
                 tracks.extend(results['items'])
@@ -143,58 +429,40 @@ class SpotifyToTidalTransfer:
                     playlist_info['tracks'].append(track_info)
             
             print(f"✅ Found {len(playlist_info['tracks'])} tracks in playlist '{playlist_info['name']}'")
-
-            # Recorremos la lista de tracks dentro de playlist_info
-            for track in playlist_info['tracks']:
-                name = track['name']
-                isrc = track['isrc']
-                
-                # Imprimimos los valores (usando un valor por defecto si el ISRC es None)
-                print(f"Name: {name} | ISRC: {isrc if isrc else 'N/A'}")            
-
             return playlist_info
             
         except Exception as e:
             print(f"❌ Error fetching Spotify playlist: {e}")
             raise
     
-    def search_tidal_track(self, track_info: Dict) -> Optional[tidalapi.Track]:
+    def search_tidal_track(self, track_info: Dict) -> Optional[Dict]:
         """Search for a track on Tidal"""
         try:
             # Try searching by ISRC first (most accurate)
             if track_info.get('isrc'):
-                print("en Spotify tiene isrc, voy a buscar en Tidal....")
-                #JLD search_results = self.tidal.search('track', track_info['isrc'])
-                isrc_a_buscar = track_info['isrc']
-                cad = f"filter%5Bisrc%5D={isrc_a_buscar}"
-                print("cad:" + cad)
-                search_results = self.tidal.search(cad, models=[tidalapi.Track])
+                search_results = self.tidal.search_tracks(track_info['isrc'], limit=5)
                 if search_results:
-                    print ("YESSSS")
-                    print(search_results)
-                    if search_results['tracks']:
-                        print ("YESSSS 22222")
-                        return search_results['tracks'][0]
+                    return search_results[0]
             
-            # # Fallback to artist + track name search
-            # artist_names = ' '.join(track_info['artists'])
-            # query = f"{artist_names} {track_info['name']}"
+            # Fallback to artist + track name search
+            artist_names = ' '.join(track_info['artists'])
+            query = f"{artist_names} {track_info['name']}"
             
-            # search_results = self.tidal.search('track', query, limit=10)
+            search_results = self.tidal.search_tracks(query, limit=10)
             
-            # if search_results and search_results['tracks']:
-            #     # Try to find the best match
-            #     for track in search_results['tracks']:
-            #         # Check if artist names match (case-insensitive)
-            #         tidal_artists = [artist.name.lower() for artist in track.artists]
-            #         spotify_artists = [artist.lower() for artist in track_info['artists']]
+            if search_results:
+                # Try to find the best match
+                for track in search_results:
+                    # Check if artist names match (case-insensitive)
+                    tidal_artists = [artist['name'].lower() for artist in track.get('artists', [])]
+                    spotify_artists = [artist.lower() for artist in track_info['artists']]
                     
-            #         # Check for artist overlap
-            #         if any(spotify_artist in ' '.join(tidal_artists) for spotify_artist in spotify_artists):
-            #             return track
+                    # Check for artist overlap
+                    if any(spotify_artist in ' '.join(tidal_artists) for spotify_artist in spotify_artists):
+                        return track
                 
-            #     # If no perfect match, return the first result
-            #     return search_results['tracks'][0]
+                # If no perfect match, return the first result
+                return search_results[0]
             
             return None
             
@@ -202,19 +470,20 @@ class SpotifyToTidalTransfer:
             print(f"⚠️  Error searching for track '{track_info['name']}': {e}")
             return None
     
-    def create_tidal_playlist(self, playlist_info: Dict) -> Optional[tidalapi.Playlist]:
+    def create_tidal_playlist(self, playlist_info: Dict) -> Optional[Dict]:
         """Create a new playlist on Tidal"""
         try:
             print(f"📝 Creating Tidal playlist: '{playlist_info['name']}'")
             
             # Create the playlist
-            playlist = self.tidal.user.create_playlist(
+            description = f"{playlist_info['description']}\n\n🎵 Transferred from Spotify"
+            playlist = self.tidal.create_playlist(
                 title=playlist_info['name'],
-                description=f"{playlist_info['description']}\n\n🎵 Transferred from Spotify"
+                description=description
             )
             
             if playlist:
-                print(f"✅ Created Tidal playlist: {playlist.name}")
+                print(f"✅ Created Tidal playlist: {playlist['title']}")
                 return playlist
             else:
                 raise Exception("Failed to create playlist")
@@ -223,7 +492,7 @@ class SpotifyToTidalTransfer:
             print(f"❌ Error creating Tidal playlist: {e}")
             return None
     
-    def add_tracks_to_tidal_playlist(self, playlist: tidalapi.Playlist, tracks: List[Dict]) -> Dict:
+    def add_tracks_to_tidal_playlist(self, playlist: Dict, tracks: List[Dict]) -> Dict:
         """Add tracks to the Tidal playlist"""
         results = {
             'added': 0,
@@ -234,6 +503,9 @@ class SpotifyToTidalTransfer:
         
         print(f"🎵 Adding {len(tracks)} tracks to Tidal playlist...")
         
+        # Collect track IDs to add in batches
+        track_ids_to_add = []
+        
         for i, track_info in enumerate(tracks, 1):
             try:
                 print(f"  [{i}/{len(tracks)}] Searching: {track_info['artists'][0]} - {track_info['name']}")
@@ -242,27 +514,41 @@ class SpotifyToTidalTransfer:
                 tidal_track = self.search_tidal_track(track_info)
                 
                 if tidal_track:
-                    print("ok in TIDAL")
-                    # Add track to playlist
-                    success = playlist.add([tidal_track.id])
-                    if success:
-                        results['added'] += 1
-                        print(f"    ✅ Added: {tidal_track.artist.name} - {tidal_track.name}")
-                    else:
-                        results['errors'] += 1
-                        print(f"    ❌ Failed to add: {track_info['artists'][0]} - {track_info['name']}")
+                    track_ids_to_add.append(tidal_track['id'])
+                    artist_name = tidal_track.get('artists', [{}])[0].get('name', 'Unknown')
+                    print(f"    ✅ Found: {artist_name} - {tidal_track['title']}")
                 else:
-                    print("FAIL in TIDAL")
                     results['not_found'] += 1
                     results['not_found_tracks'].append(f"{track_info['artists'][0]} - {track_info['name']}")
                     print(f"    ⚠️  Not found: {track_info['artists'][0]} - {track_info['name']}")
                 
+                # Add tracks in batches of 100 to avoid API limits
+                if len(track_ids_to_add) >= 100:
+                    success = self.tidal.add_tracks_to_playlist(playlist['uuid'], track_ids_to_add)
+                    if success:
+                        results['added'] += len(track_ids_to_add)
+                        print(f"    ✅ Added batch of {len(track_ids_to_add)} tracks")
+                    else:
+                        results['errors'] += len(track_ids_to_add)
+                        print(f"    ❌ Failed to add batch of {len(track_ids_to_add)} tracks")
+                    track_ids_to_add = []
+                
                 # Rate limiting - be nice to the APIs
-                time.sleep(0.5)
+                time.sleep(0.3)
                 
             except Exception as e:
                 results['errors'] += 1
                 print(f"    ❌ Error processing track: {e}")
+        
+        # Add remaining tracks
+        if track_ids_to_add:
+            success = self.tidal.add_tracks_to_playlist(playlist['uuid'], track_ids_to_add)
+            if success:
+                results['added'] += len(track_ids_to_add)
+                print(f"    ✅ Added final batch of {len(track_ids_to_add)} tracks")
+            else:
+                results['errors'] += len(track_ids_to_add)
+                print(f"    ❌ Failed to add final batch of {len(track_ids_to_add)} tracks")
         
         return results
     
